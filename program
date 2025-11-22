@@ -1,0 +1,837 @@
+from imap_tools import MailBox, A
+import os
+import re
+import shutil
+# from getpass import getpass # Niepotrzebne, skoro używamy simpledialog
+from pdf2image import convert_from_path
+import pytesseract
+from PyPDF2 import PdfReader
+from datetime import datetime, timedelta
+import tkinter as tk
+from tkinter import ttk, simpledialog, messagebox, filedialog
+import threading
+import locale
+import smtplib
+from email.mime.multipart import MIMEMultipart
+from email.mime.base import MIMEBase
+from email import encoders
+import json
+from typing import Dict, List, Optional, Any
+
+# --- Dodany import dla kalendarza ---
+from tkcalendar import Calendar, DateEntry 
+# ------------------------------------
+
+# --- Dodany import dla ttkthemes ---
+try:
+    from ttkthemes import ThemedTk
+    THEMES_AVAILABLE = True
+except ImportError:
+    print("Ostrzeżenie: ttkthemes nie zainstalowane. Aplikacja będzie używać domyślnego motywu Tkinter/ttk.")
+    THEMES_AVAILABLE = False
+# -----------------------------------
+
+
+# --- Ścieżki do zewnętrznych narzędzi OCR ---
+# 1. Ścieżka do folderu 'bin' Popplera (np. C:\poppler-23.08.0\Library\bin)
+#    !!!! Wklej tutaj prawidłową ścieżkę, jeśli zainstalowałeś Poppler !!!!
+POPPLER_PATH = r'' 
+
+# 2. Ścieżka do pliku tesseract.exe (np. C:\Program Files\Tesseract-OCR\tesseract.exe)
+#    !!! Ta ścieżka została ustawiona na podstawie Twojej informacji !!!
+TESSERACT_PATH = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
+# ---------------------------------------------
+
+# Konfiguracja
+CONFIG_FILE = "faktury_config.json"
+DEFAULT_CONFIG = {
+    "odbiorcy": {
+        "MD": {
+            "nazwa": "MD Maciej Dryżał",
+            "nip": "5842017682",
+            "email_kontaktowy": "m.d@2com.pl", # Nowe pole do kontaktu
+            "dostawcy": {}
+        },
+        "Apneo": {
+            "nazwa": "Fundacja Apneo", 
+            "nip": "5851502862",
+            "email_kontaktowy": "m.d@2com.pl",
+            "dostawcy": {}
+        },
+        "Prywatne": {
+            "nazwa": "Maciej Dryżał",
+            "nip": "",
+            "email_kontaktowy": "m.d@2com.pl",
+            "dostawcy": {},
+            "frazy": ["Maciej Dryzał", "Maciej Dryzal", "Dryzał", "Dryzal"]
+        }
+    },
+    "email_settings": {
+        "smtp_server": "imap.infocity.pl", # Zmieniono na IMAP
+        "smtp_port": 993, # Zmieniono na port IMAP (SSL)
+        "email_from": "m.d@2com.pl",
+        "email_username": "m.d@2com.pl",
+        "email_password": ""
+    }
+}
+
+# Ustawienie polskiej lokalizacji
+try:
+    locale.setlocale(locale.LC_TIME, 'pl_PL.UTF-8')
+except:
+    try:
+        locale.setlocale(locale.LC_TIME, 'Polish_Poland.1250')
+    except:
+        pass
+
+# --- Globalna konfiguracja Tesseract OCR ---
+# Ustawienie ścieżki do pliku wykonywalnego Tesseract OCR
+if TESSERACT_PATH and os.path.exists(TESSERACT_PATH):
+    pytesseract.pytesseract.tesseract_cmd = TESSERACT_PATH
+else:
+    # Jeśli ścieżka nie jest podana lub plik nie istnieje, próbujemy działać bez jawnej ścieżki (jeśli w PATH)
+    try:
+        # Próbujemy zweryfikować, czy tesseract jest dostępny w PATH
+        # To jest uproszczona weryfikacja. W produkcji można by użyć subprocess.run(['tesseract', '--version'])
+        _ = pytesseract.get_tesseract_version() # Jeśli nie znajdzie, zgłosi TesseractNotFoundError
+    except pytesseract.TesseractNotFoundError:
+        print("Ostrzeżenie: Tesseract OCR nie został skonfigurowany lub nie znaleziono w PATH. Funkcje OCR będą niedostępne.")
+        pytesseract = None # Ustawiamy pytesseract na None, aby łatwo sprawdzać jego dostępność
+    except Exception as e:
+        print(f"Ostrzeżenie: Problem z inicjalizacją Tesseract OCR: {e}. Funkcje OCR będą niedostępne.")
+        pytesseract = None
+
+# Globalna lista rozszerzeń, które będziemy próbować skanować OCR
+SCANNABLE_EXTENSIONS = ('.pdf', '.jpg', '.jpeg', '.png', '.tiff', '.tif', '.gif', '.bmp')
+# -----------------------------------------------------------
+
+
+class FakturaApp:
+    def __init__(self):
+        # Użyj ThemedTk, jeśli biblioteka jest dostępna, w przeciwnym razie wróć do tk.Tk
+        if THEMES_AVAILABLE:
+            self.root = ThemedTk(theme="cosmo") # Zmieniono motyw na "cosmo"
+        else:
+            self.root = tk.Tk()
+
+        self.root.title("Zaawansowane Sortowanie Faktur")
+        self.root.geometry("900x700")
+        
+        # Ustawienie domyślnej czcionki dla całej aplikacji (opcjonalne, poprawia spójność)
+        style = ttk.Style(self.root)
+        style.configure(".", font=("Segoe UI", 10)) # "Segoe UI" to nowoczesna czcionka Windows
+        style.configure("TButton", font=("Segoe UI", 10, "bold")) # Pogrubienie dla przycisków
+
+        self.config = self.load_config()
+        self.setup_ui()
+        
+    def load_config(self):
+        if os.path.exists(CONFIG_FILE):
+            try:
+                with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+                    loaded_config = json.load(f)
+                    # Merge with default config to ensure all keys are present for new versions
+                    merged_config = DEFAULT_CONFIG.copy()
+                    
+                    # Specjalna obsługa dla kluczy nested (odbiorcy, dostawcy)
+                    if 'odbiorcy' in loaded_config and 'odbiorcy' in merged_config:
+                        for rec_key, rec_val in loaded_config['odbiorcy'].items():
+                            if rec_key in merged_config['odbiorcy']:
+                                # Aktualizuj istniejącego odbiorcę
+                                merged_config['odbiorcy'][rec_key].update(rec_val)
+                                # Upewnij się, że dostawcy są prawidłowo sczytani
+                                if 'dostawcy' in rec_val and 'dostawcy' in merged_config['odbiorcy'][rec_key]:
+                                    for supp_key, supp_val in rec_val['dostawcy'].items():
+                                        # Konwersja starego pola 'email' na 'sender_emails'
+                                        if 'email' in supp_val and 'sender_emails' not in supp_val:
+                                            supp_val['sender_emails'] = [supp_val.pop('email')]
+                                        # Upewnij się, że sender_emails i keywords to listy
+                                        if 'sender_emails' in supp_val and not isinstance(supp_val['sender_emails'], list):
+                                            supp_val['sender_emails'] = [x.strip() for x in supp_val['sender_emails'].split(',')] # Konwersja na listę jeśli string
+                                        if 'keywords' in supp_val and not isinstance(supp_val['keywords'], list):
+                                            supp_val['keywords'] = [x.strip() for x in supp_val['keywords'].split(',')] # Konwersja na listę jeśli string
+
+                                        merged_config['odbiorcy'][rec_key]['dostawcy'][supp_key] = supp_val
+                            else:
+                                # Dodaj nowego odbiorcę
+                                merged_config['odbiorcy'][rec_key] = rec_val
+                    
+                    # Aktualizuj email_settings aby używać IMAP zamiast SMTP jako domyślnego serwera
+                    # Pamiętaj, że klucze są "smtp_server" i "smtp_port" ale używamy ich dla IMAP
+                    # Sprawdzamy czy to domyślna wartość SMTP_SERVER z DEFAULT_CONFIG, aby ją zmienić na IMAP
+                    if 'email_settings' in loaded_config and 'smtp_server' in loaded_config['email_settings'] and loaded_config['email_settings']['smtp_server'] == DEFAULT_CONFIG['email_settings']['smtp_server'] and DEFAULT_CONFIG['email_settings']['smtp_server'] != "imap.infocity.pl":
+                        merged_config['email_settings']['smtp_server'] = "imap.infocity.pl"
+                        merged_config['email_settings']['smtp_port'] = 993
+
+                    # Inne top-level klucze
+                    for key, value in loaded_config.items():
+                        if key not in ['odbiorcy', 'email_settings']: # Już przetworzone
+                            if isinstance(value, dict) and key in merged_config:
+                                merged_config[key].update(value)
+                            else:
+                                merged_config[key] = value
+
+                    return merged_config
+            except json.JSONDecodeError:
+                messagebox.showerror("Błąd konfiguracji", "Nie udało się wczytać pliku konfiguracyjnego JSON. Zostaną użyte ustawienia domyślne.")
+                return DEFAULT_CONFIG.copy()
+            except Exception as e:
+                messagebox.showerror("Błąd konfiguracji", f"Wystąpił nieoczekiwany błąd podczas wczytywania konfiguracji: {e}. Zostaną użyte ustawienia domyślne.")
+                return DEFAULT_CONFIG.copy()
+        return DEFAULT_CONFIG.copy()
+    
+    def save_config(self):
+        try:
+            with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+                json.dump(self.config, f, ensure_ascii=False, indent=2)
+            # messagebox.showinfo("Zapisano konfigurację", "Ustawienia zostały pomyślnie zapisane.") # Uncomment for user feedback
+        except Exception as e:
+            messagebox.showerror("Błąd zapisu konfiguracji", f"Nie udało się zapisać ustawień: {e}")
+    
+    def setup_ui(self):
+        # Notebook (zakładki)
+        notebook = ttk.Notebook(self.root)
+        notebook.pack(fill='both', expand=True, padx=10, pady=10)
+        
+        # Zakładka główna
+        frame_main = ttk.Frame(notebook)
+        notebook.add(frame_main, text="📁 Główne")
+        
+        # Zakładka konfiguracji dostawców
+        frame_dostawcy = ttk.Frame(notebook)
+        notebook.add(frame_dostawcy, text="👥 Dostawcy")
+        
+        # Zakładka ustawień email
+        frame_email = ttk.Frame(notebook)
+        notebook.add(frame_email, text="📧 Email")
+        
+        self.setup_main_tab(frame_main)
+        self.setup_dostawcy_tab(frame_dostawcy)
+        self.setup_email_tab(frame_email)
+        
+    def setup_main_tab(self, frame):
+        # Nagłówek
+        tk.Label(frame, text="🎯 Automatyczne Sortowanie Faktur", 
+                font=("Segoe UI", 16, "bold")).pack(pady=10) # Używamy Segoe UI
+        
+        # Tryb pracy
+        frame_tryb = ttk.LabelFrame(frame, text="Tryb pracy")
+        frame_tryb.pack(pady=10, padx=20, fill='x')
+        
+        self.tryb_var = tk.StringVar(value="auto")
+        ttk.Radiobutton(frame_tryb, text="Automatyczny (poprzedni miesiąc)", 
+                       variable=self.tryb_var, value="auto").pack(anchor='w', padx=10, pady=5)
+        ttk.Radiobutton(frame_tryb, text="Ręczny (wybierz daty)", 
+                       variable=self.tryb_var, value="manual").pack(anchor='w', padx=10, pady=5)
+        
+        # Zakres dat
+        self.frame_daty = ttk.Frame(frame_tryb)
+        
+        # Ustawienie domyślnych dat: dzisiaj i rok wcześniej
+        today = datetime.now()
+        one_year_ago_date = today.replace(year=today.year - 1)
+        
+        ttk.Label(self.frame_daty, text="Data od:").grid(row=0, column=0, padx=5)
+        # Zmieniono na DateEntry, usunięto ręczne style
+        self.entry_data_od = DateEntry(self.frame_daty, width=12, date_pattern='dd.mm.yyyy')
+        self.entry_data_od.grid(row=0, column=1, padx=5)
+        self.entry_data_od.set_date(one_year_ago_date)
+        
+        ttk.Label(self.frame_daty, text="Data do:").grid(row=0, column=2, padx=5)
+        # Zmieniono na DateEntry, usunięto ręczne style
+        self.entry_data_do = DateEntry(self.frame_daty, width=12, date_pattern='dd.mm.yyyy')
+        self.entry_data_do.grid(row=0, column=3, padx=5)
+        self.entry_data_do.set_date(today)
+
+        # Nowy element: Szybki zakres dat
+        ttk.Label(self.frame_daty, text="Szybki zakres:").grid(row=1, column=0, padx=5, pady=5, sticky='w')
+        self.combo_date_preset = ttk.Combobox(self.frame_daty, values=["Ostatni rok", "6 miesięcy wstecz", "3 miesiące wstecz"], state='readonly')
+        self.combo_date_preset.grid(row=1, column=1, columnspan=3, padx=5, pady=5, sticky='ew')
+        self.combo_date_preset.set("Ostatni rok") # Domyślna wartość
+        self.combo_date_preset.bind('<<ComboboxSelected>>', self.set_manual_date_range_preset)
+        
+        # Folder bazowy
+        frame_folder = ttk.LabelFrame(frame, text="Folder docelowy")
+        frame_folder.pack(pady=10, padx=20, fill='x')
+        
+        frame_folder_input = ttk.Frame(frame_folder)
+        frame_folder_input.pack(pady=10, padx=10, fill='x')
+        
+        self.entry_folder = ttk.Entry(frame_folder_input)
+        self.entry_folder.pack(side='left', fill='x', expand=True, padx=5)
+        self.entry_folder.insert(0, "C:/Faktury") # Placeholder
+        
+        ttk.Button(frame_folder_input, text="Przeglądaj", command=self.wybierz_folder).pack(side='right')
+        
+        # Pasek postępu
+        frame_postep = ttk.LabelFrame(frame, text="Postęp")
+        frame_postep.pack(pady=10, padx=20, fill='x')
+        
+        self.progress = ttk.Progressbar(frame_postep, mode='indeterminate')
+        self.progress.pack(pady=10, padx=10, fill='x')
+        
+        self.label_status = tk.Label(frame_postep, text="Gotowy do uruchomienia...")
+        self.label_status.pack(pady=5)
+        
+        # Przyciski akcji
+        frame_akcje = ttk.Frame(frame)
+        frame_akcje.pack(pady=20)
+        
+        ttk.Button(frame_akcje, text="🚀 URUCHOM SORTOWANIE", 
+                  command=self.uruchom_sortowanie, width=25).pack(pady=5)
+        
+        ttk.Button(frame_akcje, text="📤 WYŚLIJ EMAILE Z FAKTURAMI", 
+                  command=self.wyslij_emaile, width=25).pack(pady=5)
+        
+        ttk.Button(frame_akcje, text="📊 POKAŻ RAPORT BRAKÓW", 
+                  command=self.pokaz_raport, width=25).pack(pady=5)
+        
+        self.tryb_var.trace('w', self.aktualizuj_widok)
+        self.aktualizuj_widok()
+        
+    def aktualizuj_widok(self, *args):
+        if self.tryb_var.get() == "manual":
+            self.frame_daty.pack(pady=5, padx=10)
+        else:
+            self.frame_daty.pack_forget()
+
+    def wybierz_folder(self):
+        folder_selected = filedialog.askdirectory()
+        if folder_selected:
+            self.entry_folder.delete(0, tk.END)
+            self.entry_folder.insert(0, folder_selected)
+            self.config['base_folder'] = folder_selected # Optionally save this to config
+            self.save_config()
+
+    # Helper method to calculate X months ago, returning the first day of that month
+    def _get_date_x_months_ago(self, ref_date, months_ago):
+        year = ref_date.year
+        month = ref_date.month - months_ago
+        while month <= 0:
+            month += 12
+            year -= 1
+        return datetime(year, month, 1).date() # Return date object
+
+    def set_manual_date_range_preset(self, event):
+        selected_preset = self.combo_date_preset.get()
+        today = datetime.now().date() # Używamy tylko daty
+
+        # "Data do" pozostaje dzisiejszą datą dla wszystkich presetów
+        self.entry_data_do.set_date(today)
+
+        data_od = None
+        if selected_preset == "Ostatni rok":
+            data_od = today.replace(year=today.year - 1)
+        elif selected_preset == "6 miesięcy wstecz":
+            data_od = self._get_date_x_months_ago(today, 6)
+        elif selected_preset == "3 miesiące wstecz":
+            data_od = self._get_date_x_months_ago(today, 3)
+        
+        if data_od:
+            self.entry_data_od.set_date(data_od)
+
+    def _update_status_and_messagebox(self, status_text: str, message_type: str = 'info', message_title: str = '', message_text: str = ''):
+        """Pomocnicza funkcja do bezpiecznej aktualizacji statusu i wyświetlania messageboxów z wątku."""
+        self.root.after(0, lambda: self.label_status.config(text=status_text))
+        if message_text: # Wyświetlamy messagebox tylko jeśli message_text jest podany
+            if message_type == 'info':
+                self.root.after(0, lambda: messagebox.showinfo(message_title, message_text))
+            elif message_type == 'warning':
+                self.root.after(0, lambda: messagebox.showwarning(message_title, message_text))
+            elif message_type == 'error':
+                self.root.after(0, lambda: messagebox.showerror(message_title, message_text))
+
+
+    def uruchom_sortowanie_thread(self, email_password: str): # Hasło jest teraz przekazywane
+        self.root.after(0, self.progress.start)
+        self._update_status_and_messagebox("Rozpoczynam sortowanie...")
+
+        try:
+            # 1. Pobierz parametry
+            base_folder = self.entry_folder.get()
+            selected_recipient_key = self.combo_odbiorca.get()
+            recipient_config = self.config['odbiorcy'].get(selected_recipient_key)
+            
+            if not base_folder or not os.path.isdir(base_folder):
+                self._update_status_and_messagebox(f"Błąd: Nieprawidłowy folder docelowy: '{base_folder}'. Upewnij się, że istnieje i jest dostępny.", 'error', "Błąd", f"Nieprawidłowy folder docelowy: '{base_folder}'. Upewnij się, że istnieje i jest dostępny.")
+                return
+
+            if not recipient_config:
+                self._update_status_and_messagebox("Błąd: Wybierz odbiorcę, dla którego chcesz sortować faktury (zakładka 'Dostawcy').", 'warning', "Błąd", "Wybierz odbiorcę, dla którego chcesz sortować faktury (zakładka 'Dostawcy').")
+                return
+            
+            recipient_nip = recipient_config.get('nip')
+            
+            email_settings = self.config['email_settings']
+            imap_server = email_settings.get('smtp_server')
+            imap_port = email_settings.get('smtp_port')
+            email_username = email_settings.get('email_username')
+
+            if not (imap_server and imap_port and email_username):
+                self._update_status_and_messagebox("Błąd: Brak pełnych ustawień email (serwer, port, nazwa użytkownika). Uzupełnij w zakładce 'Email'.", 'error', "Błąd", "Brak pełnych ustawień email (serwer, port, nazwa użytkownika). Uzupełnij w zakładce 'Email'.")
+                return
+
+            # Ustalenie zakresu dat
+            if self.tryb_var.get() == "auto":
+                today = datetime.now().date()
+                # Poprzedni miesiąc: koniec poprzedniego miesiąca to pierwszy dzień bieżącego - 1 dzień
+                end_date = (datetime(today.year, today.month, 1) - timedelta(days=1)).date()
+                start_date = datetime(end_date.year, end_date.month, 1).date()
+            else: # manual
+                start_date = self.entry_data_od.get_date() # Pobieramy obiekt date z DateEntry
+                end_date = self.entry_data_do.get_date() # Pobieramy obiekt date z DateEntry
+            
+            # Aby imap_tools.fetch() działało poprawnie z datą końcową (inclusive)
+            # Dodajemy jeden dzień do daty końcowej, aby zakres był 'start_date' do 'end_date' WŁĄCZNIE
+            end_date_for_search = end_date + timedelta(days=1)
+
+
+            fetched_mails_count = 0
+            processed_attachments_count = 0
+            saved_attachments_count = 0
+            
+            # 2. Połącz z IMAP
+            self._update_status_and_messagebox(f"Łączenie ze skrzynką IMAP {email_username}...")
+            try:
+                with MailBox(imap_server, port=imap_port, ssl=True).login(email_username, email_password) as mailbox:
+                    self._update_status_and_messagebox("Połączono. Szukam faktur...")
+                    
+                    if not recipient_config['dostawcy']:
+                        self._update_status_and_messagebox("Brak skonfigurowanych dostawców dla tego odbiorcy. Pomięto sortowanie email.", 'warning', "Informacja", "Brak skonfigurowanych dostawców dla wybranego odbiorcy. Pomięto sortowanie emaili.")
+                        return
+
+                    for supplier_name, supplier_data in recipient_config['dostawcy'].items():
+                        sender_emails = supplier_data.get('sender_emails', []) # Lista adresów
+                        keywords = supplier_data.get('keywords', []) # Lista słów kluczowych
+
+                        if not sender_emails and not keywords:
+                            self._update_status_and_messagebox(f"Pominięto dostawcę {supplier_name} - brak skonfigurowanych adresów email lub słów kluczowych.", 'warning', "Informacja", f"Pominięto dostawcę {supplier_name} - brak skonfigurowanych adresów email lub słów kluczowych.")
+                            continue
+
+                        self._update_status_and_messagebox(f"Szukanie faktur od {supplier_name} (nadawcy: {', '.join(sender_emails)})...")
+
+                        # Budowanie kryteriów wyszukiwania IMAP
+                        imap_criteria = A.date_gte(start_date) & A.date_lt(end_date_for_search)
+                        
+                        # Dodaj kryteria dla nadawców
+                        if sender_emails:
+                            # Tworzymy listę kryteriów FROM dla każdego adresu i łączymy je operatorem OR
+                            from_criteria = None
+                            for email_addr in sender_emails:
+                                if from_criteria is None:
+                                    from_criteria = A.from_(email_addr)
+                                else:
+                                    from_criteria |= A.from_(email_addr)
+                            imap_criteria &= from_criteria
+
+                        # Dodaj kryteria dla słów kluczowych w temacie lub treści
+                        if keywords:
+                            # Tworzymy listę kryteriów SUBJECT/BODY dla każdego słowa i łączymy je operatorem OR
+                            keyword_criteria = None
+                            for keyword in keywords:
+                                if keyword_criteria is None:
+                                    keyword_criteria = A.subject(keyword) | A.body(keyword)
+                                else:
+                                    keyword_criteria |= A.subject(keyword) | A.body(keyword)
+                            if keyword_criteria:
+                                imap_criteria &= keyword_criteria
+                        
+                        # Pobieramy maile spełniające kryteria. Limit do 1000, aby uniknąć przeciążenia
+                        for msg in mailbox.fetch(criteria=imap_criteria, reverse=True, limit=1000):
+                            fetched_mails_count += 1
+                            self._update_status_and_messagebox(f"Przetwarzam mail od {', '.join(sender_emails)} (Tytuł: {msg.subject[:50]}...) z dnia {msg.date.strftime('%d.%m.%Y')}...")
+                            
+                            for att in msg.attachments:
+                                processed_attachments_count += 1
+                                file_extension = os.path.splitext(att.filename)[1].lower()
+
+                                # Jeśli załącznik jest jednym z formatów do skanowania
+                                if file_extension in SCANNABLE_EXTENSIONS:
+                                    # 3. Utwórz strukturę folderów: FolderBazowy/NazwaOdbiorcy/NazwaDostawcy/Rok
+                                    target_dir = os.path.join(base_folder, recipient_config['nazwa'], supplier_name, str(msg.date.year))
+                                    os.makedirs(target_dir, exist_ok=True) # Utwórz katalogi, jeśli nie istnieją
+                                    
+                                    # 4. Zapisz załącznik
+                                    original_filename = att.filename
+                                    # Usuń potencjalnie niebezpieczne znaki z nazwy pliku
+                                    sanitized_filename = re.sub(r'[\\/:*?"<>|]', '_', original_filename)
+                                    file_path = os.path.join(target_dir, sanitized_filename)
+                                    
+                                    # Dodaj numerację lub unikalny znacznik, jeśli plik już istnieje
+                                    counter = 1
+                                    while os.path.exists(file_path):
+                                        name, ext = os.path.splitext(sanitized_filename)
+                                        file_path = os.path.join(target_dir, f"{name}_{counter}{ext}")
+                                        counter += 1
+
+                                    try:
+                                        with open(file_path, 'wb') as f:
+                                            f.write(att.payload)
+                                        saved_attachments_count += 1
+                                        self._update_status_and_messagebox(f"Zapisano: {os.path.basename(file_path)} do {target_dir}")
+                                        
+                                        # --- Logika OCR i weryfikacji NIP ---
+                                        if pytesseract: # Sprawdź, czy Tesseract jest dostępny
+                                            extracted_text = ""
+                                            self._update_status_and_messagebox(f"Analizuję OCR dla {os.path.basename(file_path)}...")
+                                            try:
+                                                if file_extension == '.pdf':
+                                                    # Spróbuj najpierw sprawdzić, czy PDF zawiera tekst (nie jest obrazem)
+                                                    pdf_has_text = False
+                                                    try:
+                                                        reader = PdfReader(file_path)
+                                                        for page in reader.pages:
+                                                            page_text = page.extract_text()
+                                                            if page_text and page_text.strip():
+                                                                extracted_text += page_text
+                                                                pdf_has_text = True
+                                                        if pdf_has_text:
+                                                            self._update_status_and_messagebox(f"Wyodrębniono tekst z PDF (bez OCR) dla {os.path.basename(file_path)}.")
+                                                    except Exception as e_pdf_text:
+                                                        self._update_status_and_messagebox(f"Błąd ekstrakcji tekstu z PDF: {e_pdf_text}. Spróbuję OCR.", 'warning')
+                                                    
+                                                    if not extracted_text: # Jeśli PDF był skanem lub wystąpił błąd ekstrakcji
+                                                        # Konwersja PDF do obrazu (wymaga Popplera)
+                                                        # poppler_path jest potrzebny jeśli Poppler nie jest w systemowym PATH
+                                                        # convert_from_path rzuca wyjątek, jeśli nie znajdzie popplera
+                                                        images = convert_from_path(file_path, first_page=1, last_page=1, dpi=300, poppler_path=POPPLER_PATH if POPPLER_PATH else None)
+                                                        if images:
+                                                            extracted_text = pytesseract.image_to_string(images[0], lang='pol') # Możesz zmienić 'pol' na inny język
+                                                            self._update_status_and_messagebox(f"Wykonano OCR na PDF dla {os.path.basename(file_path)}.")
+                                                        else:
+                                                            self._update_status_and_messagebox(f"Brak stron do OCR w {os.path.basename(file_path)}. (Poppler Path: {POPPLER_PATH})", 'warning')
+                                                elif file_extension in ('.jpg', '.jpeg', '.png', '.tiff', '.tif', '.gif', '.bmp'): # Załącznik to obraz
+                                                    extracted_text = pytesseract.image_to_string(file_path, lang='pol')
+                                                    self._update_status_and_messagebox(f"Wykonano OCR na obrazie dla {os.path.basename(file_path)}.")
+                                                
+                                                # Weryfikacja NIP
+                                                if recipient_nip:
+                                                    # Normalizujemy NIP (usuwamy spacje, myślniki, kropki) dla lepszego dopasowania
+                                                    normalized_recipient_nip = re.sub(r'[ \-.]', '', recipient_nip)
+                                                    normalized_extracted_text = re.sub(r'[ \-.]', '', extracted_text) # Normalizujemy tekst z OCR
+                                                    
+                                                    if normalized_recipient_nip in normalized_extracted_text:
+                                                        self._update_status_and_messagebox(f"✅ Znaleziono NIP ({recipient_nip}) w {os.path.basename(file_path)}!")
+                                                    else:
+                                                        self._update_status_and_messagebox(f"❌ Brak NIP ({recipient_nip}) w {os.path.basename(file_path)} (lub nie znaleziono).", 'warning')
+                                                else:
+                                                    self._update_status_and_messagebox(f"Brak NIP odbiorcy w konfiguracji dla {os.path.basename(file_path)}. Pomięto weryfikację.", 'info')
+
+                                            except pytesseract.TesseractNotFoundError:
+                                                self._update_status_and_messagebox("Błąd: Tesseract OCR nie znaleziono. Upewnij się, że jest zainstalowany i ścieżka ustawiona.", 'error', "Błąd OCR")
+                                            except Exception as ocr_e:
+                                                self._update_status_and_messagebox(f"Błąd OCR/konwersji dla {os.path.basename(file_path)}: {ocr_e}", 'error', "Błąd OCR/konwersji")
+                                                print(f"Błąd OCR/konwersji dla {file_path}: {ocr_e}")
+                                        else:
+                                            self._update_status_and_messagebox(f"Pominięto OCR dla {os.path.basename(file_path)} - Tesseract OCR nie jest dostępny.", 'info')
+                                        # -----------------------------------------------
+
+                                    except Exception as write_e:
+                                        self._update_status_and_messagebox(f"Błąd zapisu pliku {os.path.basename(file_path)}: {write_e}", 'error', "Błąd zapisu pliku")
+                                        print(f"Błąd zapisu {file_path}: {write_e}")
+                                else:
+                                    self._update_status_and_messagebox(f"Pominięto nieobsługiwany załącznik: {os.path.basename(att.filename)}", 'info')
+
+                self._update_status_and_messagebox(f"Sortowanie zakończone! Pobranych maili: {fetched_mails_count}, przetworzono załączników: {processed_attachments_count}, zapisano faktur: {saved_attachments_count}", 'info', "Sukces", f"Sortowanie zakończone!\nPobranych maili: {fetched_mails_count}\nPrzetworzono załączników: {processed_attachments_count}\nZapisanych faktur: {saved_attachments_count}\nFaktury znajdziesz w: {base_folder}")
+
+            except Exception as e:
+                self._update_status_and_messagebox(f"Wystąpił błąd IMAP: {e}", 'error', "Błąd sortowania", f"Wystąpił błąd podczas połączenia IMAP lub sortowania: {e}")
+            finally:
+                # Na wszelki wypadek, jeśli hasło zostało tymczasowo zapisane w obiekcie, usuń je.
+                self.config['email_settings'].pop('email_password', None)
+                # self.save_config() # Nie zapisujemy configu tutaj, żeby nie zapisywać danych jeśli użytkownik by chciał to zrobić
+
+        except Exception as e:
+            self._update_status_and_messagebox(f"Wystąpił ogólny błąd: {e}", 'error', "Błąd sortowania", f"Wystąpił nieoczekiwany błąd podczas sortowania faktur: {e}")
+        finally:
+            self.root.after(0, self.progress.stop)
+            self._update_status_and_messagebox("Gotowy do uruchomienia...")
+
+    def uruchom_sortowanie(self):
+        # Zapytaj o hasło w głównym wątku, ZANIM uruchomimy wątek w tle
+        email_settings = self.config['email_settings']
+        email_username = email_settings.get('email_username')
+        
+        # Jeśli nie ma username, to nie możemy pytać o hasło
+        if not email_username:
+            messagebox.showerror("Błąd konfiguracji", "Brak nazwy użytkownika email w ustawieniach. Uzupełnij zakładkę 'Email'.")
+            return
+
+        email_password = simpledialog.askstring("Hasło do skrzynki email", f"Podaj hasło dla {email_username}:", show='*')
+        
+        if not email_password:
+            messagebox.showwarning("Anulowano", "Sortowanie anulowane - brak hasła do skrzynki email.")
+            return
+
+        # Uruchom sortowanie w osobnym wątku, przekazując hasło
+        thread = threading.Thread(target=self.uruchom_sortowanie_thread, args=(email_password,))
+        thread.start()
+
+    def wyslij_emaile(self):
+        messagebox.showinfo("Informacja", "Funkcja 'wyslij_emaile' jeszcze nie zaimplementowana. W przyszłości umożliwi wysyłanie zebranych faktur.")
+
+    def pokaz_raport(self):
+        messagebox.showinfo("Informacja", "Funkcja 'pokaz_raport' jeszcze nie zaimplementowana. W przyszłości wyświetli raport brakujących faktur.")
+        
+    def setup_dostawcy_tab(self, frame):
+        # Wybór odbiorcy
+        frame_wybor = ttk.Frame(frame)
+        frame_wybor.pack(pady=10, padx=20, fill='x')
+        
+        ttk.Label(frame_wybor, text="Odbiorca:").pack(side='left')
+        self.combo_odbiorca = ttk.Combobox(frame_wybor, values=list(self.config['odbiorcy'].keys()), state='readonly')
+        self.combo_odbiorca.pack(side='left', padx=10)
+        self.combo_odbiorca.bind('<<ComboboxSelected>>', self.wczytaj_dostawcow)
+        
+        # Lista dostawców
+        frame_lista = ttk.LabelFrame(frame, text="Dostawcy")
+        frame_lista.pack(pady=10, padx=20, fill='both', expand=True)
+        
+        # Treeview
+        columns = ("nazwa", "czestotliwosc", "emails_keywords") # Zmieniono nazwę kolumny
+        self.tree_dostawcy = ttk.Treeview(frame_lista, columns=columns, show='headings', height=10)
+        
+        self.tree_dostawcy.heading("nazwa", text="Nazwa dostawcy")
+        self.tree_dostawcy.heading("czestotliwosc", text="Częstotliwość")
+        self.tree_dostawcy.heading("emails_keywords", text="Emaile i słowa kluczowe") # Zmieniono tekst nagłówka
+        
+        self.tree_dostawcy.column("nazwa", width=180)
+        self.tree_dostawcy.column("czestotliwosc", width=100)
+        self.tree_dostawcy.column("emails_keywords", width=300) # Zwiększono szerokość
+        
+        # Scrollbar
+        scrollbar = ttk.Scrollbar(frame_lista, orient='vertical', command=self.tree_dostawcy.yview)
+        self.tree_dostawcy.configure(yscrollcommand=scrollbar.set)
+        
+        self.tree_dostawcy.pack(side='left', fill='both', expand=True, padx=5, pady=5)
+        scrollbar.pack(side='right', fill='y', pady=5)
+        
+        # Przyciski zarządzania
+        frame_przyciski = ttk.Frame(frame_lista)
+        frame_przyciski.pack(pady=10)
+        
+        ttk.Button(frame_przyciski, text="➕ Dodaj", command=self.dodaj_dostawce).pack(side='left', padx=5)
+        ttk.Button(frame_przyciski, text="✏️ Edytuj", command=self.edytuj_dostawce).pack(side='left', padx=5)
+        ttk.Button(frame_przyciski, text="🗑️ Usuń", command=self.usun_dostawce).pack(side='left', padx=5)
+        
+        # Wczytaj domyślnego odbiorcę
+        self.combo_odbiorca.set("MD")
+        self.wczytaj_dostawcow(None)
+
+    def wczytaj_dostawcow(self, event):
+        odbiorca_key = self.combo_odbiorca.get()
+        for item in self.tree_dostawcy.get_children():
+            self.tree_dostawcy.delete(item)
+        
+        if odbiorca_key in self.config['odbiorcy']:
+            dostawcy = self.config['odbiorcy'][odbiorca_key]['dostawcy']
+            for nazwa_dostawcy, dane_dostawcy in dostawcy.items():
+                sender_emails_str = ", ".join(dane_dostawcy.get('sender_emails', []))
+                keywords_str = ", ".join(dane_dostawcy.get('keywords', []))
+                emails_keywords_combined = f"E: {sender_emails_str}; SŁ: {keywords_str}"
+                
+                self.tree_dostawcy.insert('', 'end', iid=nazwa_dostawcy, 
+                                          values=(nazwa_dostawcy, 
+                                                  dane_dostawcy.get('czestotliwosc', 'miesięczna'),
+                                                  emails_keywords_combined)) # Wyświetlamy połączone emaile/słowa
+
+    def dodaj_dostawce(self):
+        odbiorca_key = self.combo_odbiorca.get()
+        if not odbiorca_key:
+            messagebox.showwarning("Brak odbiorcy", "Wybierz odbiorcę przed dodaniem dostawcy.")
+            return
+
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Dodaj dostawcę")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        
+        dialog.grid_columnconfigure(1, weight=1)
+
+        ttk.Label(dialog, text="Nazwa dostawcy:").grid(row=0, column=0, padx=5, pady=5, sticky='w')
+        entry_nazwa = ttk.Entry(dialog, width=40)
+        entry_nazwa.grid(row=0, column=1, padx=5, pady=5, sticky='ew')
+
+        ttk.Label(dialog, text="Częstotliwość:").grid(row=1, column=0, padx=5, pady=5, sticky='w')
+        combo_czestotliwosc = ttk.Combobox(dialog, values=["miesięczna", "kwartalna", "roczna"], state='readonly')
+        combo_czestotliwosc.grid(row=1, column=1, padx=5, pady=5, sticky='ew')
+        combo_czestotliwosc.set("miesięczna") # Domyślna wartość
+
+        ttk.Label(dialog, text="Emaile nadawców (oddziel przecinkami):").grid(row=2, column=0, padx=5, pady=5, sticky='w')
+        entry_sender_emails = ttk.Entry(dialog, width=40)
+        entry_sender_emails.grid(row=2, column=1, padx=5, pady=5, sticky='ew')
+
+        ttk.Label(dialog, text="Słowa kluczowe (oddziel przecinkami):").grid(row=3, column=0, padx=5, pady=5, sticky='w')
+        entry_keywords = ttk.Entry(dialog, width=40)
+        entry_keywords.grid(row=3, column=1, padx=5, pady=5, sticky='ew')
+
+        def save():
+            nazwa = entry_nazwa.get().strip()
+            czestotliwosc = combo_czestotliwosc.get().strip() # Pobieramy z Combobox
+            sender_emails_input = entry_sender_emails.get().strip()
+            keywords_input = entry_keywords.get().strip()
+
+            if not nazwa:
+                messagebox.showwarning("Brak nazwy", "Nazwa dostawcy nie może być pusta.")
+                return
+
+            if nazwa in self.config['odbiorcy'][odbiorca_key]['dostawcy']:
+                messagebox.showwarning("Duplikat", f"Dostawca o nazwie '{nazwa}' już istnieje dla tego odbiorcy.")
+                return
+            
+            # Przetwarzanie stringów na listy
+            sender_emails = [e.strip() for e in sender_emails_input.split(',') if e.strip()] if sender_emails_input else []
+            keywords = [k.strip() for k in keywords_input.split(',') if k.strip()] if keywords_input else []
+
+            self.config['odbiorcy'][odbiorca_key]['dostawcy'][nazwa] = {
+                "czestotliwosc": czestotliwosc,
+                "sender_emails": sender_emails,
+                "keywords": keywords
+            }
+            self.save_config()
+            self.wczytaj_dostawcow(None)
+            dialog.destroy()
+
+        ttk.Button(dialog, text="Zapisz", command=save).grid(row=4, column=0, columnspan=2, pady=10)
+
+    def edytuj_dostawce(self):
+        selected_item = self.tree_dostawcy.selection()
+        if not selected_item:
+            messagebox.showwarning("Brak wyboru", "Wybierz dostawcę do edycji.")
+            return
+
+        nazwa_dostawcy_old = self.tree_dostawcy.item(selected_item[0], 'iid')
+        current_data = self.config['odbiorcy'][self.combo_odbiorca.get()]['dostawcy'][nazwa_dostawcy_old]
+
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Edytuj dostawcę")
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        dialog.grid_columnconfigure(1, weight=1)
+
+        ttk.Label(dialog, text="Nazwa dostawcy:").grid(row=0, column=0, padx=5, pady=5, sticky='w')
+        entry_nazwa = ttk.Entry(dialog, width=40)
+        entry_nazwa.grid(row=0, column=1, padx=5, pady=5, sticky='ew')
+        entry_nazwa.insert(0, nazwa_dostawcy_old)
+
+        ttk.Label(dialog, text="Częstotliwość:").grid(row=1, column=0, padx=5, pady=5, sticky='w')
+        combo_czestotliwosc = ttk.Combobox(dialog, values=["miesięczna", "kwartalna", "roczna"], state='readonly')
+        combo_czestotliwosc.grid(row=1, column=1, padx=5, pady=5, sticky='ew')
+        combo_czestotliwosc.set(current_data.get('czestotliwosc', 'miesięczna')) # Ustawiamy obecną wartość
+
+        ttk.Label(dialog, text="Emaile nadawców (oddziel przecinkami):").grid(row=2, column=0, padx=5, pady=5, sticky='w')
+        entry_sender_emails = ttk.Entry(dialog, width=40)
+        entry_sender_emails.grid(row=2, column=1, padx=5, pady=5, sticky='ew')
+        entry_sender_emails.insert(0, ", ".join(current_data.get('sender_emails', [])))
+
+        ttk.Label(dialog, text="Słowa kluczowe (oddziel przecinkami):").grid(row=3, column=0, padx=5, pady=5, sticky='w')
+        entry_keywords = ttk.Entry(dialog, width=40)
+        entry_keywords.grid(row=3, column=1, padx=5, pady=5, sticky='ew')
+        entry_keywords.insert(0, ", ".join(current_data.get('keywords', [])))
+
+        def save():
+            nazwa = entry_nazwa.get().strip()
+            czestotliwosc = combo_czestotliwosc.get().strip() # Pobieramy z Combobox
+            sender_emails_input = entry_sender_emails.get().strip()
+            keywords_input = entry_keywords.get().strip()
+
+            if not nazwa:
+                messagebox.showwarning("Brak nazwy", "Nazwa dostawcy nie może być pusta.")
+                return
+            
+            odbiorca_dostawcy = self.config['odbiorcy'][self.combo_odbiorca.get()]['dostawcy']
+            if nazwa != nazwa_dostawcy_old and nazwa in odbiorca_dostawcy:
+                 messagebox.showwarning("Duplikat", f"Dostawca o nazwie '{nazwa}' już istnieje dla tego odbiorcy.")
+                 return
+            
+            # Przetwarzanie stringów na listy
+            sender_emails = [e.strip() for e in sender_emails_input.split(',') if e.strip()] if sender_emails_input else []
+            keywords = [k.strip() for k in keywords_input.split(',') if k.strip()] if keywords_input else []
+
+            if nazwa != nazwa_dostawcy_old:
+                del odbiorca_dostawcy[nazwa_dostawcy_old]
+            
+            odbiorca_dostawcy[nazwa] = {
+                "czestotliwosc": czestotliwosc,
+                "sender_emails": sender_emails,
+                "keywords": keywords
+            }
+            self.save_config()
+            self.wczytaj_dostawcow(None)
+            dialog.destroy()
+
+        ttk.Button(dialog, text="Zapisz", command=save).grid(row=4, column=0, columnspan=2, pady=10)
+
+    def usun_dostawce(self):
+        selected_item = self.tree_dostawcy.selection()
+        if not selected_item:
+            messagebox.showwarning("Brak wyboru", "Wybierz dostawcę do usunięcia.")
+            return
+
+        nazwa_dostawcy = self.tree_dostawcy.item(selected_item[0], 'iid')
+        if messagebox.askyesno("Potwierdź usunięcie", f"Czy na pewno chcesz usunąć dostawcę '{nazwa_dostawcy}'?"):
+            del self.config['odbiorcy'][self.combo_odbiorca.get()]['dostawcy'][nazwa_dostawcy]
+            self.save_config()
+            self.wczytaj_dostawcow(None)
+        
+    def setup_email_tab(self, frame):
+        tk.Label(frame, text="⚙️ Konfiguracja serwera email", 
+                font=("Segoe UI", 12, "bold")).pack(pady=10) # Używamy Segoe UI
+        
+        frame_ustawienia = ttk.LabelFrame(frame, text="Ustawienia IMAP") # Zmieniono na IMAP
+        frame_ustawienia.pack(pady=10, padx=20, fill='x')
+        
+        # IMAP Server
+        ttk.Label(frame_ustawienia, text="Serwer IMAP:").grid(row=0, column=0, padx=10, pady=5, sticky='w')
+        self.entry_imap_server = ttk.Entry(frame_ustawienia, width=30)
+        self.entry_imap_server.grid(row=0, column=1, padx=10, pady=5, sticky='we')
+        self.entry_imap_server.insert(0, self.config['email_settings']['smtp_server']) # Nadal używa klucza smtp_server
+
+        # IMAP Port
+        ttk.Label(frame_ustawienia, text="Port IMAP (SSL):").grid(row=1, column=0, padx=10, pady=5, sticky='w')
+        self.entry_imap_port = ttk.Entry(frame_ustawienia, width=10)
+        self.entry_imap_port.grid(row=1, column=1, padx=10, pady=5, sticky='we')
+        self.entry_imap_port.insert(0, self.config['email_settings']['smtp_port']) # Nadal używa klucza smtp_port
+
+        # Email Username
+        ttk.Label(frame_ustawienia, text="Nazwa użytkownika email:").grid(row=2, column=0, padx=10, pady=5, sticky='w')
+        self.entry_email_username = ttk.Entry(frame_ustawienia, width=30)
+        self.entry_email_username.grid(row=2, column=1, padx=10, pady=5, sticky='we')
+        self.entry_email_username.insert(0, self.config['email_settings'].get('email_username', self.config['email_settings']['email_from']))
+
+        # Email Password (NIE jest odczytywane, tylko wpisywane przez użytkownika, jeśli chce zapisać - choć nadal nie jest zapisywane do pliku)
+        ttk.Label(frame_ustawienia, text="Hasło email:").grid(row=3, column=0, padx=10, pady=5, sticky='w')
+        self.entry_email_password = ttk.Entry(frame_ustawienia, width=30, show="*") # Mask input
+        self.entry_email_password.grid(row=3, column=1, padx=10, pady=5, sticky='we')
+
+        # Configure columns to expand
+        frame_ustawienia.grid_columnconfigure(1, weight=1)
+
+        # Save button for email settings
+        ttk.Button(frame, text="💾 Zapisz ustawienia Email", command=self.save_email_settings).pack(pady=15)
+
+    def save_email_settings(self):
+        try:
+            self.config['email_settings']['smtp_server'] = self.entry_imap_server.get().strip() # Nadal używamy klucza smtp_server dla IMAP
+            self.config['email_settings']['smtp_port'] = int(self.entry_imap_port.get().strip()) # Nadal używamy klucza smtp_port dla IMAP
+            self.config['email_settings']['email_username'] = self.entry_email_username.get().strip()
+            
+            # Wprowadzone hasło jest przechowywane tylko w tymczasowej konfiguracji obiektu, ale NIE ZAPISYWANE do pliku
+            entered_password = self.entry_email_password.get()
+            if entered_password:
+                self.config['email_settings']['email_password'] = entered_password
+            else:
+                self.config['email_settings'].pop('email_password', None) # Usuń, jeśli pole puste
+
+            self.save_config()
+            messagebox.showinfo("Sukces", "Ustawienia email zostały zapisane (hasło nie jest zapisywane do pliku konfiguracyjnego).")
+        except ValueError:
+            messagebox.showerror("Błąd", "Port musi być liczbą całkowitą.")
+        except Exception as e:
+            messagebox.showerror("Błąd", f"Nie udało się zapisać ustawień email: {e}")
+
+# Example usage (assuming the rest of your application logic is defined elsewhere)
+if __name__ == "__main__":
+    app = FakturaApp()
+    app.root.mainloop()
